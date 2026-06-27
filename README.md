@@ -1,364 +1,272 @@
 # Project 1: Scalable Web Application with ALB and Auto Scaling
 
-> **Architecture:** EC2-Based | **Cloud:** AWS | **Pattern:** Multi-AZ, High Availability
-
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Architecture Diagram](#architecture-diagram)
-- [Architecture Deep Dive](#architecture-deep-dive)
-  - [Network Layer — VPC](#1-network-layer--vpc)
-  - [Edge Layer — CloudFront & WAF](#2-edge-layer--cloudfront--waf)
-  - [Compute Layer — EC2 & ASG](#3-compute-layer--ec2--asg)
-  - [Database Layer — RDS Multi-AZ](#4-database-layer--rds-multi-az)
-  - [Security](#5-security)
-  - [Observability](#6-observability)
-- [AWS Services Used](#aws-services-used)
-- [Key Design Decisions](#key-design-decisions)
-- [Learning Outcomes](#learning-outcomes)
-- [Prerequisites](#prerequisites)
-- [Deployment Guide](#deployment-guide)
-- [Cost Estimate](#cost-estimate)
-
----
+> **Architecture:** EC2-Based • **Cloud:** AWS • **Availability:** Multi-AZ • **Pattern:** Three-Tier Architecture
 
 ## Overview
 
-This project deploys a **production-grade, highly available web application** on AWS using EC2 instances inside a properly architected VPC. The architecture spans **two Availability Zones (AZ-1 and AZ-2)** to eliminate single points of failure, with all compute resources isolated in private subnets for maximum security.
+This project demonstrates a production-inspired, highly available web application architecture on AWS. The solution follows a **three-tier architecture** (Web, Application, and Database tiers) deployed across **two Availability Zones** for resilience.
 
-**Key capabilities:**
-- ⚡ **Auto Scaling** — scales EC2 instances automatically based on CPU load (target tracking at 60%)
-- 🌍 **Global CDN** — CloudFront caches static assets at edge locations to reduce latency
-- 🛡️ **WAF Protection** — OWASP Top 10 rules block common web attacks before they reach compute
-- 🗄️ **Database HA** — RDS Multi-AZ with synchronous replication and automated failover
-- 🔒 **Zero-trust Access** — Session Manager replaces SSH/Bastion for instance access (no open ports)
-- 📊 **Full Observability** — CloudWatch dashboards, alarms, and SNS notifications
+The architecture includes:
+
+- Route 53 for DNS
+- CloudFront as CDN
+- AWS WAF for edge protection
+- Internet Gateway
+- External Application Load Balancer
+- Web Tier Auto Scaling Group
+- Internal Application Load Balancer
+- Application Tier Auto Scaling Group
+- Amazon RDS Multi-AZ
+- CloudTrail + S3 Audit Logs
+- CloudWatch + SNS Monitoring
+- Bastion Host and AWS Systems Manager Session Manager
+- Single NAT Gateway (Lab/Cost-optimized design)
 
 ---
 
-## Architecture Diagram
+# Architecture
 
 ![Architecture Diagram](diagrams/architecture-diagram.png)
 
-> *Project 1: Scalable Web Application with ALB and Auto Scaling — EC2-Based Architecture*
-
 ---
 
-## Architecture Deep Dive
+# Traffic Flow
 
-### 1. Network Layer — VPC
-
-The VPC is the foundation of the architecture, organized into **three tiers** across two AZs:
-
-```
-VPC (e.g. 10.0.0.0/16)
-│
-├── AZ-1
-│   ├── Public Subnet   (10.0.1.0/24)  → ALB, Bastion Host, NAT GW
-│   ├── Private Subnet  (10.0.2.0/24)  → EC2 / ASG (App Tier)
-│   └── Private Subnet  (10.0.3.0/24)  → RDS Primary (Data Tier)
-│
-└── AZ-2
-    ├── Public Subnet   (10.0.4.0/24)  → ALB, NAT GW
-    ├── Private Subnet  (10.0.5.0/24)  → EC2 / ASG (App Tier)
-    └── Private Subnet  (10.0.6.0/24)  → RDS Standby (Data Tier)
-```
-
-**Route Tables:**
-
-| Subnet | Destination | Target |
-|--------|-------------|--------|
-| Public | `0.0.0.0/0` | Internet Gateway |
-| Private (App) | `0.0.0.0/0` | NAT Gateway (same AZ) |
-| Private (DB) | local only | — |
-
-> ⚠️ Each AZ has its own **NAT Gateway** — if AZ-1 NAT fails, AZ-2 EC2 instances continue to reach the internet via AZ-2 NAT.
-
----
-
-### 2. Edge Layer — CloudFront & WAF
-
-**Traffic flow:**
-
-```
-Users → Route 53 → CloudFront (+ WAF) → Internet Gateway → ALB → EC2
-                         ↓
-                    S3 (static assets: images, CSS, JS)
-```
-
-- **Route 53** — Alias record pointing to ALB with health checks. Automatic DNS failover if ALB becomes unhealthy.
-- **CloudFront** — Caches static content at AWS edge locations globally. Reduces latency and offloads traffic from EC2.
-- **WAF** — Attached to CloudFront. Enforces OWASP Top 10 rules (SQL injection, XSS, rate limiting) before requests reach the VPC.
-- **ALB** — Layer 7 load balancer distributing traffic across EC2 instances in both AZs. Performs health checks every 30 seconds.
-
----
-
-### 3. Compute Layer — EC2 & ASG
-
-**Web Tier (Public Subnet):**
-- EC2 instances serve as the web-facing layer (Nginx/Apache)
-- Managed by an **Auto Scaling Group** with a Launch Template
-- Scaling policy: **Target Tracking at 60% CPU** (min: 2, desired: 2, max: 6)
-
-**App Tier (Private Subnet):**
-- EC2 instances handle application logic (Node.js / Python / Java)
-- No direct internet exposure — traffic only from ALB
-- **Session Manager** enables secure CLI access without SSH keys or open ports
-
-**Auto Scaling Config:**
-```
-Min capacity  : 2  (always on across both AZs)
-Desired       : 2
-Max capacity  : 6
-Scale-out     : CPU > 60% for 2 consecutive periods
-Scale-in      : CPU < 40% for 10 consecutive periods
+```text
+Users
+   │
+HTTPS
+   │
+Route 53
+   │
+CloudFront
+   │
+AWS WAF
+   │
+Internet Gateway
+   │
+External ALB
+   │
+Web Tier (ASG)
+   │
+Internal ALB
+   │
+Application Tier (ASG)
+   │
+Amazon RDS Primary
+   │
+Synchronous Replication
+   │
+Amazon RDS Standby
 ```
 
 ---
 
-### 4. Database Layer — RDS Multi-AZ
+# Architecture Components
 
-```
-App EC2 (Port 3306/5432)
-     ↓
-RDS Primary (AZ-1)  ──sync replication──►  RDS Standby (AZ-2)
-                                                   ↑
-                                        Auto failover (~60–120 sec)
-```
+## Edge Layer
 
-- **Engine:** MySQL or PostgreSQL
-- **Multi-AZ:** Synchronous replication — zero data loss on failover
-- **Automated Backups:** Daily snapshots + transaction logs (point-in-time restore)
-- **No public access** — DB subnet has no route to the internet
+- Amazon Route 53
+- Amazon CloudFront
+- AWS WAF
+- Internet Gateway
+
+CloudFront caches content globally while AWS WAF protects against common attacks such as SQL Injection, XSS and rate limiting.
 
 ---
 
-### 5. Security
+## Network Layer
 
-| Layer | Mechanism | Details |
-|-------|-----------|---------|
-| Edge | WAF | OWASP Top 10, rate limiting |
-| Network | Security Groups | Stateful rules — only allow necessary ports |
-| Network | NACLs | Stateless subnet-level rules |
-| Network | Private Subnets | EC2 and RDS not reachable from internet |
-| Access | Session Manager | No SSH, no Bastion, no open port 22 |
-| Audit | CloudTrail | Every API call logged to S3 |
-| Data | RDS Encryption | Encrypted at rest (AES-256) and in transit (TLS) |
+- One VPC
+- Two Availability Zones
+- Public and Private Subnets
+- Internet Gateway
+- One NAT Gateway (cost-optimized lab deployment)
 
-**Security Group Rules (summary):**
-
-```
-ALB SG         → accepts 80/443 from 0.0.0.0/0
-EC2 SG         → accepts traffic from ALB SG only
-RDS SG         → accepts 3306/5432 from EC2 SG only
-```
+> **Note:** A single NAT Gateway is intentionally used to reduce lab cost. For production environments, one NAT Gateway per Availability Zone is recommended to eliminate a single point of failure.
 
 ---
 
-### 6. Observability
+## Web Tier
 
-```
-EC2 / ALB / RDS → CloudWatch Metrics & Logs
-                         ↓
-                  CloudWatch Alarms
-                         ↓
-                      SNS Topic → Email Notifications
-```
+- External ALB
+- EC2 Auto Scaling Group
+- Bastion Host
+- Public Subnets
 
-**Recommended Alarms:**
-
-| Alarm | Threshold | Action |
-|-------|-----------|--------|
-| CPU Utilization | > 80% | SNS Email |
-| ALB 5xx Errors | > 10/min | SNS Email |
-| RDS Storage | < 20% free | SNS Email |
-| ASG Scale-out | triggered | SNS Email |
-
-**CloudTrail** → logs all API calls → stores in S3 (Audit Logs bucket)
+Responsibilities:
+- Accept user traffic
+- Distribute requests
+- Scale automatically
 
 ---
 
-## AWS Services Used
+## Application Tier
+
+- Internal ALB
+- EC2 Auto Scaling Group
+- Session Manager Access
+- Private Subnets
+
+Responsibilities:
+- Business logic
+- Private communication
+- No direct internet access
+
+---
+
+## Database Tier
+
+Amazon RDS Multi-AZ
+
+- Primary DB
+- Standby DB
+- Automatic failover
+- Synchronous replication
+- Private subnet only
+
+---
+
+# Monitoring & Logging
+
+CloudWatch collects metrics and logs.
+
+SNS sends email alerts.
+
+CloudTrail records AWS API activity and stores audit logs in Amazon S3.
+
+---
+
+# Security
+
+## Network Security
+
+- Security Groups
+- Network ACLs
+- Private Subnets
+- Internal ALB
+
+## Edge Security
+
+- AWS WAF
+- CloudFront
+- HTTPS
+
+## Access Security
+
+- Bastion Host
+- AWS Systems Manager Session Manager
+- IAM Roles
+
+## Database Security
+
+- Private RDS
+- Security Group restrictions
+- Encryption in transit and at rest
+
+---
+
+# High Availability
+
+- Multi-AZ deployment
+- Auto Scaling Groups
+- External and Internal ALBs
+- Health Checks
+- RDS Multi-AZ automatic failover
+
+---
+
+# Failure Scenario
+
+If AZ-1 becomes unavailable:
+
+- ALB routes traffic to healthy instances.
+- Auto Scaling replaces failed instances.
+- RDS fails over to the standby instance.
+- Application continues serving users.
+
+---
+
+# AWS Services
 
 | Service | Purpose |
 |---------|---------|
-| **VPC** | Network isolation, subnets, route tables, NACLs |
-| **EC2** | Web and application compute |
-| **Auto Scaling Group** | Automatic scaling based on demand |
-| **ALB** | Layer 7 load balancing, health checks |
-| **CloudFront** | CDN, static asset caching |
-| **WAF** | OWASP Top 10 protection, rate limiting |
-| **RDS Multi-AZ** | Managed relational database with HA |
-| **Route 53** | DNS routing, health checks |
-| **NAT Gateway** | Outbound internet for private subnets |
-| **Internet Gateway** | Inbound/outbound internet for public subnets |
-| **Systems Manager** | Session Manager — bastion-free EC2 access |
-| **CloudWatch** | Metrics, logs, dashboards, alarms |
-| **SNS** | Alarm notifications via email |
-| **CloudTrail** | API audit logging |
-| **S3** | Static assets (CloudFront origin) + CloudTrail logs |
-| **IAM** | Roles and policies for EC2, SSM, RDS access |
+| VPC | Network isolation |
+| EC2 | Compute |
+| Auto Scaling | Automatic scaling |
+| ALB | Load balancing |
+| Route53 | DNS |
+| CloudFront | CDN |
+| WAF | Edge protection |
+| NAT Gateway | Outbound internet |
+| Internet Gateway | Public connectivity |
+| RDS Multi-AZ | Database HA |
+| IAM | Identity |
+| Systems Manager | Secure management |
+| CloudWatch | Monitoring |
+| SNS | Notifications |
+| CloudTrail | Auditing |
+| S3 | Audit log storage |
 
 ---
 
-## Key Design Decisions
+# Deployment Summary
 
-### ✅ Why NAT Gateway per AZ (not one shared)?
-A single NAT Gateway is a single point of failure. If its AZ goes down, all private EC2 instances across all AZs lose internet access. One NAT Gateway per AZ ensures fault isolation.
-
-### ✅ Why Session Manager instead of Bastion Host?
-| Bastion Host | Session Manager |
-|---|---|
-| Extra EC2 cost | No extra infrastructure |
-| Port 22 must be open | Zero open ports |
-| Key management overhead | IAM-based access |
-| Audit requires extra setup | All sessions logged automatically |
-
-### ✅ Why WAF on CloudFront (not ALB)?
-Attaching WAF to CloudFront means malicious traffic is blocked at the **edge**, before it enters the AWS network — saving bandwidth and compute costs.
-
-### ✅ Why Multi-AZ RDS over Read Replica?
-Multi-AZ provides **automatic failover** (HA), while Read Replicas provide **read scalability**. For production HA, Multi-AZ is the correct choice.
+1. Create VPC and subnets.
+2. Attach Internet Gateway.
+3. Create NAT Gateway.
+4. Configure route tables.
+5. Create Security Groups.
+6. Launch Bastion Host.
+7. Create Launch Templates.
+8. Deploy Web Tier ASG.
+9. Deploy Internal ALB.
+10. Deploy App Tier ASG.
+11. Deploy RDS Multi-AZ.
+12. Configure Route53, CloudFront and WAF.
+13. Configure CloudWatch, SNS and CloudTrail.
 
 ---
 
-## Learning Outcomes
+# Repository Structure
 
-By completing this project, you will be able to:
-
-- ✅ Design VPCs with correct subnet, route table, and NAT Gateway configurations
-- ✅ Build highly available architectures across multiple Availability Zones
-- ✅ Configure ALB listener rules and target group health checks
-- ✅ Implement Auto Scaling with target tracking and step scaling policies
-- ✅ Secure applications with WAF, Security Groups, and private subnets
-- ✅ Use Systems Manager Session Manager as a bastion-free access alternative
-- ✅ Set up CloudWatch dashboards and alarms with SNS notifications
-- ✅ Configure RDS Multi-AZ with automated backups and failover
-
----
-
-## Prerequisites
-
-- AWS Account with appropriate IAM permissions
-- AWS CLI configured (`aws configure`)
-- Basic knowledge of networking (CIDR, subnets, routing)
-- Familiarity with EC2, VPC, and IAM concepts
-
----
-
-## Deployment Guide
-
-### Step 1 — VPC & Networking
-```bash
-# Create VPC
-aws ec2 create-vpc --cidr-block 10.0.0.0/16
-
-# Create subnets (repeat for each AZ)
-aws ec2 create-subnet --vpc-id <vpc-id> --cidr-block 10.0.1.0/24 --availability-zone us-east-1a
-
-# Create and attach Internet Gateway
-aws ec2 create-internet-gateway
-aws ec2 attach-internet-gateway --vpc-id <vpc-id> --internet-gateway-id <igw-id>
-
-# Create NAT Gateways (one per AZ — requires Elastic IP)
-aws ec2 allocate-address --domain vpc
-aws ec2 create-nat-gateway --subnet-id <public-subnet-id> --allocation-id <eip-id>
-```
-
-### Step 2 — Security Groups
-```bash
-# ALB Security Group
-aws ec2 create-security-group --group-name alb-sg --description "ALB SG" --vpc-id <vpc-id>
-aws ec2 authorize-security-group-ingress --group-id <alb-sg-id> --protocol tcp --port 443 --cidr 0.0.0.0/0
-
-# EC2 Security Group (allow from ALB only)
-aws ec2 create-security-group --group-name ec2-sg --description "EC2 SG" --vpc-id <vpc-id>
-aws ec2 authorize-security-group-ingress --group-id <ec2-sg-id> --protocol tcp --port 80 --source-group <alb-sg-id>
-```
-
-### Step 3 — Launch Template & ASG
-```bash
-# Create Launch Template
-aws ec2 create-launch-template \
-  --launch-template-name web-lt \
-  --launch-template-data '{
-    "ImageId": "ami-0abcdef1234567890",
-    "InstanceType": "t3.medium",
-    "IamInstanceProfile": {"Name": "SSMInstanceProfile"},
-    "SecurityGroupIds": ["<ec2-sg-id>"]
-  }'
-
-# Create Auto Scaling Group
-aws autoscaling create-auto-scaling-group \
-  --auto-scaling-group-name web-asg \
-  --launch-template LaunchTemplateName=web-lt \
-  --min-size 2 --desired-capacity 2 --max-size 6 \
-  --vpc-zone-identifier "<private-subnet-az1>,<private-subnet-az2>"
-```
-
-### Step 4 — RDS Multi-AZ
-```bash
-aws rds create-db-instance \
-  --db-instance-identifier prod-db \
-  --db-instance-class db.t3.medium \
-  --engine mysql \
-  --master-username admin \
-  --master-user-password <password> \
-  --multi-az \
-  --db-subnet-group-name <db-subnet-group> \
-  --no-publicly-accessible
-```
-
-### Step 5 — ALB
-```bash
-# Create ALB
-aws elbv2 create-load-balancer \
-  --name web-alb \
-  --subnets <public-subnet-az1> <public-subnet-az2> \
-  --security-groups <alb-sg-id>
-
-# Create Target Group
-aws elbv2 create-target-group \
-  --name web-tg \
-  --protocol HTTP --port 80 \
-  --vpc-id <vpc-id> \
-  --health-check-path /health
-```
-
-### Step 6 — CloudFront + WAF
-```bash
-# Create WAF Web ACL (OWASP managed rules)
-aws wafv2 create-web-acl \
-  --name prod-waf \
-  --scope CLOUDFRONT \
-  --default-action Allow={} \
-  --rules file://waf-rules.json \
-  --visibility-config SampledRequestsEnabled=true,CloudWatchMetricsEnabled=true,MetricName=prod-waf
+```text
+.
+├── diagrams/
+│   └── architecture-diagram.png
+├── screenshots/
+├── scripts/
+└── README.md
 ```
 
 ---
 
-## Cost Estimate
+# Learning Outcomes
 
-> Approximate monthly cost for a **dev/test** deployment in `us-east-1`:
-
-| Service | Est. Monthly Cost |
-|---------|------------------|
-| EC2 (2x t3.medium) | ~$60 |
-| NAT Gateway (2x) | ~$65 |
-| ALB | ~$20 |
-| RDS Multi-AZ (db.t3.medium) | ~$100 |
-| CloudFront (10GB transfer) | ~$1 |
-| WAF | ~$10 |
-| CloudWatch | ~$10 |
-| **Total** | **~$266/month** |
-
-> 💡 Use **AWS Free Tier** where available and **stop/terminate resources** when not in use to minimize costs.
+- VPC Design
+- Multi-AZ Architecture
+- Application Load Balancers
+- Auto Scaling
+- Private Networking
+- Amazon RDS Multi-AZ
+- CloudFront
+- AWS WAF
+- Monitoring with CloudWatch
+- AWS Security Best Practices
 
 ---
 
-## License
+# Future Improvements
 
-This project is for educational purposes as part of the AWS Manara Program.
+- Terraform
+- CI/CD Pipeline
+- ECS or EKS
+- Secrets Manager
+- AWS Backup
+- VPC Endpoints
+
+---
+
+# License
+
+Educational project created as part of AWS learning and portfolio development.
