@@ -234,8 +234,6 @@ If AZ-1 becomes unavailable:
 .
 ├── diagrams/
 │   └── architecture-diagram.png
-├── screenshots/
-├── scripts/
 └── README.md
 ```
 
